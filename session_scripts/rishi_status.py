@@ -32,6 +32,8 @@ import social_publishers as sp  # noqa: E402
 
 PLACEHOLDER = "business-suite"
 problems: list[str] = []
+real_public_count: list[int] = []  # set by youtube(), read by website() - real API truth,
+                                    # not the calendar-date guess that caused a false positive
 
 
 def when(text: str) -> datetime:
@@ -111,6 +113,7 @@ def main() -> int:
             for it in yt.videos().list(part="status,statistics", id=",".join(ids[i:i + 50])).execute()["items"]:
                 st[it["id"]] = it
         pub = [v for v in st.values() if v["status"]["privacyStatus"] == "public"]
+        real_public_count.append(len(pub))
         sched = [v for v in st.values() if v["status"].get("publishAt")]
         gone = [r for r in rows if r["yt_video_id"] not in st]
         views = sorted(int(v["statistics"].get("viewCount", 0)) for v in pub)
@@ -191,9 +194,12 @@ def main() -> int:
         local = json.load(open(web / "data" / "videos.json", encoding="utf-8"))["episodes"]
         live = json.load(urllib.request.urlopen("https://rishi-indian-stocks-explained.vercel.app/data/videos.json?x=%d" % now.timestamp(), timeout=20))["episodes"]
         ll, vl = sum(1 for e in local if e["youtube"]), sum(1 for e in live if e["youtube"])
-        public_db = con.execute("select count(*) from episodes where yt_video_id is not null and yt_video_id!=? and scheduled_for<=?", (PLACEHOLDER, now.isoformat(timespec="seconds"))).fetchone()[0]
-        print(f"  episodes local={len(local)} live={len(live)};  YouTube links local={ll} live={vl};  public per DB={public_db}")
-        warn(f"live site has {vl} YouTube links but {public_db} videos are public - redeploy needed") if vl < public_db else ok("live site YouTube links up to date")
+        public_now = real_public_count[0] if real_public_count else None
+        print(f"  episodes local={len(local)} live={len(live)};  YouTube links local={ll} live={vl};  actually public on YouTube now={public_now}")
+        if public_now is not None and vl < public_now:
+            warn(f"live site has {vl} YouTube links but {public_now} videos are actually public - redeploy needed")
+        else:
+            ok("live site YouTube links up to date")
     section("Website", website)
 
     head("SUMMARY")
