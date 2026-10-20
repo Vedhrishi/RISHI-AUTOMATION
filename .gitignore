@@ -1,0 +1,6 @@
+videos/
+**/__pycache__/
+*.pyc
+.env
+*.env
+credentials/

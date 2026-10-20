@@ -1,0 +1,80 @@
+# Install at: .github/workflows/rishi-publish.yml in the repo root.
+# Runs the posting pipeline on GitHub's own servers — the laptop does not
+# need to be on. Requires every secret in SECRETS_CHECKLIST.md to be set
+# first (Settings -> Secrets and variables -> Actions) and the engine code
+# + topics_pipeline.db + video_url-populated rows to already be committed
+# (see migrate_videos_to_supabase.py).
+name: RISHI publish
+
+on:
+  schedule:
+    - cron: '30 1 * * *'   # 07:00 IST morning slot
+    - cron: '30 13 * * *'  # 19:00 IST evening slot
+  workflow_dispatch: {}      # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write   # needed to commit the updated DB + website data back
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r sebi_fin_engine/requirements.txt
+
+      - name: Reconstruct credentials
+        working-directory: sebi_fin_engine
+        env:
+          YT_TOKEN_JSON: ${{ secrets.YT_TOKEN_JSON }}
+        run: |
+          mkdir -p credentials
+          printf '%s' "$YT_TOKEN_JSON" > credentials/yt_token.json
+          cat > .env <<EOF
+          DB_PATH=topics_pipeline.db
+          LOG_DIR=logs
+          YT_TOKEN_FILE=credentials/yt_token.json
+          YT_CLIENT_SECRET_FILE=credentials/client_secret.json
+          GRAPH_API_VERSION=v21.0
+          META_ACCESS_TOKEN=${{ secrets.META_ACCESS_TOKEN }}
+          FB_APP_ID=${{ secrets.FB_APP_ID }}
+          FB_APP_SECRET=${{ secrets.FB_APP_SECRET }}
+          FB_PAGE_ID=${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_ACCESS_TOKEN=${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          IG_USER_ID=${{ secrets.IG_USER_ID }}
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY=${{ secrets.SUPABASE_SERVICE_KEY }}
+          REELS_BUCKET=reels-staging
+          EOF
+          cat > credentials/client_secret.json <<'EOF'
+          ${{ secrets.YT_CLIENT_SECRET_JSON }}
+          EOF
+
+      # KNOWN GAP: this renews the token for THIS run only — the runner is
+      # ephemeral, so a renewed token isn't automatically saved back to the
+      # META_ACCESS_TOKEN secret for the next run. Updating a repo secret
+      # from inside a workflow needs a PAT with the `secrets` scope (the
+      # default GITHUB_TOKEN can't write secrets) via the GitHub API. Until
+      # that's wired up, keep running meta_token_renew.py from the laptop
+      # periodically too, or this will eventually need a real fix here.
+      - name: Renew Meta token if close to expiry
+        working-directory: sebi_fin_engine
+        run: python meta_token_renew.py
+
+      - name: Run publisher
+        working-directory: sebi_fin_engine
+        run: python ci_runner.py
+
+      - name: Commit updated queue state + website data
+        run: |
+          git config user.name "rishi-publish-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add sebi_fin_engine/topics_pipeline.db website/data website/supabase website/thumbs || true
+          git diff --cached --quiet || git commit -m "Automated publish run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
