@@ -1,0 +1,134 @@
+# Install at: .github/workflows/rishi-publish.yml in the repo root.
+# Improvement over v1: Meta token renewal now writes the refreshed token back to
+# the GitHub secret (requires GH_PAT_SECRETS_WRITE secret — a PAT with the
+# "secrets" scope). Also adds a conditional Vercel redeploy step.
+#
+# New secrets needed vs. v1:
+#   GH_PAT_SECRETS_WRITE  — personal access token, classic, with repo+secrets scope
+#   VERCEL_TOKEN          — from vercel.com/account/tokens
+#   VERCEL_PROJECT_ID     — from .vercel/project.json in the website repo
+#   VERCEL_ORG_ID         — from .vercel/project.json in the website repo
+name: RISHI publish
+
+on:
+  schedule:
+    - cron: '30 1 * * *'   # 07:00 IST morning slot
+    - cron: '30 13 * * *'  # 19:00 IST evening slot
+  workflow_dispatch: {}     # manual trigger from Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r sebi_fin_engine/requirements.txt
+
+      - name: Install PyNaCl for secret encryption
+        run: pip install pynacl
+
+      - name: Reconstruct credentials
+        working-directory: sebi_fin_engine
+        env:
+          YT_TOKEN_JSON: ${{ secrets.YT_TOKEN_JSON }}
+          YT_CLIENT_SECRET_JSON: ${{ secrets.YT_CLIENT_SECRET_JSON }}
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          FB_APP_ID: ${{ secrets.FB_APP_ID }}
+          FB_APP_SECRET: ${{ secrets.FB_APP_SECRET }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          mkdir -p credentials logs
+          printf '%s' "$YT_TOKEN_JSON" > credentials/yt_token.json
+          printf '%s' "$YT_CLIENT_SECRET_JSON" > credentials/client_secret.json
+          cat > .env <<EOF
+          DB_PATH=topics_pipeline.db
+          LOG_DIR=logs
+          YT_TOKEN_FILE=credentials/yt_token.json
+          YT_CLIENT_SECRET_FILE=credentials/client_secret.json
+          GRAPH_API_VERSION=v21.0
+          META_ACCESS_TOKEN=$META_ACCESS_TOKEN
+          FB_APP_ID=$FB_APP_ID
+          FB_APP_SECRET=$FB_APP_SECRET
+          FB_PAGE_ID=$FB_PAGE_ID
+          FB_PAGE_ACCESS_TOKEN=$FB_PAGE_ACCESS_TOKEN
+          IG_USER_ID=$IG_USER_ID
+          SUPABASE_URL=$SUPABASE_URL
+          SUPABASE_SERVICE_KEY=$SUPABASE_SERVICE_KEY
+          REELS_BUCKET=reels-staging
+          EOF
+
+      - name: Renew Meta token (write back to GitHub secret if refreshed)
+        working-directory: sebi_fin_engine
+        env:
+          GH_PAT: ${{ secrets.GH_PAT_SECRETS_WRITE }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # meta_token_renew.py --ci-output prints NEW_TOKEN=<value> only if
+          # a new token was actually fetched; prints nothing otherwise.
+          python meta_token_renew.py --ci-output > /tmp/tok.txt 2>&1 || true
+          cat /tmp/tok.txt
+          NEW_TOK=$(grep '^NEW_TOKEN=' /tmp/tok.txt | cut -d= -f2- || true)
+          if [ -z "$NEW_TOK" ] || [ -z "$GH_PAT" ]; then
+            echo "Token still valid or GH_PAT not configured — skipping secret update."
+            exit 0
+          fi
+          # Fetch the repo's public key for secret encryption
+          PUBKEY_JSON=$(curl -fsS \
+            -H "Authorization: token $GH_PAT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$GH_REPO/actions/secrets/public-key")
+          KEY_ID=$(echo "$PUBKEY_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['key_id'])")
+          KEY_B64=$(echo "$PUBKEY_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['key'])")
+          # Encrypt with libsodium sealed box (PyNaCl)
+          ENCRYPTED=$(python3 -c "
+          import base64, os, nacl.public
+          pub = nacl.public.PublicKey(base64.b64decode(os.environ['KEY_B64']))
+          box = nacl.public.SealedBox(pub)
+          print(base64.b64encode(box.encrypt(os.environ['NEW_TOK'].encode())).decode())
+          " KEY_B64="$KEY_B64" NEW_TOK="$NEW_TOK")
+          # PUT the updated secret
+          HTTP=$(curl -fsS -o /dev/null -w "%{http_code}" -X PUT \
+            -H "Authorization: token $GH_PAT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/$GH_REPO/actions/secrets/META_ACCESS_TOKEN" \
+            -d "{\"encrypted_value\":\"$ENCRYPTED\",\"key_id\":\"$KEY_ID\"}")
+          echo "GitHub secret update HTTP status: $HTTP"
+
+      - name: Run publisher
+        working-directory: sebi_fin_engine
+        run: python ci_runner.py
+
+      - name: Commit updated queue state and website data
+        run: |
+          git config user.name "rishi-publish-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add sebi_fin_engine/topics_pipeline.db website/data/ || true
+          git diff --cached --quiet || git commit -m "publish run $(date -u +'%Y-%m-%dT%H:%MZ')"
+          git push
+
+      - name: Redeploy Vercel if website data changed
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+        run: |
+          if git diff HEAD~1 --name-only 2>/dev/null | grep -q 'website/data/'; then
+            npx vercel --prod --token "$VERCEL_TOKEN" --yes website/
+            echo "Vercel redeployed."
+          else
+            echo "No website data change — skipping Vercel redeploy."
+          fi
